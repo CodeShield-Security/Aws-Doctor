@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  document-scanner
+
+
+Parameters:
+  UserPoolID:
+    Type: String
+    Description: (Required) The user pool ID created by the Amplify frontend.
+
+  AmplifyStackName:
+    Type: String
+    Description: (Required) The stack name of the Amplify backend deployment.
+
+  BucketName:
+    Type: String
+    Description: (Required) A universally unique name for the user file bucket. Must be all lowercase. 
+
+
+Globals:
+  Api:
+    Cors:
+      AllowMethods: "'*'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+
+Resources:
+
+  DocumentScannerAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolID}'
+            Identity:
+              Header: Authorization
+        AddDefaultAuthorizerToCorsPreflight: False
+
+  UserFileBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: "Retain"
+    Properties:
+      BucketName: !Ref BucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - HEAD
+              - DELETE
+            AllowedOrigins:
+              - "*"
+            ExposedHeaders:
+              - "x-amz-server-side-encryption"
+              - "x-amz-request-id"
+              - "x-amz-id-2"
+              - "ETag"
+            MaxAge: 3000
+            Id: "S3CorsConfig"
+
+  GeneratePDF:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/generatePDF/
+      Layers:
+        - !Ref FPDFLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PagesTable
+      Environment:
+        Variables:
+          PAGES_TABLE_NAME: !Ref PagesTable
+      Events:
+        GetResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DocumentScannerAPI
+            Path: /pages/pdf/{project+}
+            Method: get
+
+  FPDFLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+        LayerName: document-scanner-dependencies
+        Description: Dependencies for Document Scanner GeneratePDF function
+        ContentUri: dependencies/
+        CompatibleRuntimes:
+          - python3.8
+        LicenseInfo: 'MIT'
+        RetentionPolicy: Retain
+
+  ProcessDocument:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/processDocument/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PagesTable
+        - TextractPolicy: {}
+        - S3ReadPolicy:
+            BucketName: !Ref BucketName
+      Environment:
+        Variables:
+          PAGES_TABLE_NAME: !Ref PagesTable
+      Events:
+        ImageUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref UserFileBucket
+            Events: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                - Name: suffix
+                  Value: ".png"
+
+  CreateProject:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/createProject/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
+      Environment:
+        Variables:
+          PROJECTS_TABLE_NAME: !Ref ProjectsTable
+      Events:
+        PostResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DocumentScannerAPI
+            Path: /projects
+            Method: post
+
+  FetchPageCount:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/fetchPageCount/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PagesTable
+      Environment:
+        Variables:
+          PAGES_TABLE_NAME: !Ref PagesTable
+      Events:
+        GetResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DocumentScannerAPI
+            Path: /pages/count/{project+}
+            Method: get
+
+  DeleteProject:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/deleteProject/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PagesTable
+        - S3CrudPolicy:
+            BucketName: !Ref UserFileBucket
+      Environment:
+        Variables:
+          PROJECTS_TABLE_NAME: !Ref ProjectsTable
+          PAGES_TABLE_NAME: !Ref PagesTable
+          BUCKET_NAME: !Ref UserFileBucket
+      Events:
+        PostResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DocumentScannerAPI
+            Path: /projects/delete
+            Method: post
+
+  FetchProjects:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.handler
+      Runtime: python3.8
+      CodeUri: lambda_functions/fetchProjects/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
+      Environment:
+        Variables:
+          PROJECTS_TABLE_NAME: !Ref ProjectsTable
+      Events:
+        GetResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref DocumentScannerAPI
+            Path: /projects
+            Method: get
+
+  ProjectsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "username"
+          AttributeType: "S"
+        -
+          AttributeName: "project_name"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+        - AttributeName: project_name
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+
+  PagesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "project"
+          AttributeType: "S"
+        -
+          AttributeName: "page"
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: project
+          KeyType: HASH
+        - AttributeName: page
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+
+  UserFileBucketAuthRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${UserFileBucket}/public/*"
+              - !Join
+                  - ''
+                  - - !Sub "arn:aws:s3:::${UserFileBucket}"
+                    - "/protected/${cognito-identity.amazonaws.com:sub}/*"
+              - !Join
+                  - ''
+                  - - !Sub "arn:aws:s3:::${UserFileBucket}"
+                    - "/private/${cognito-identity.amazonaws.com:sub}/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}/uploads/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}/protected/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:ListBucket"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}"
+            Condition:
+              StringLike:
+                "s3:prefix":
+                  - "public/"
+                  - "public/*"
+                  - "protected/"
+                  - "protected/*"
+                  - "private/${cognito-identity.amazonaws.com:sub}/"
+                  - "private/${cognito-identity.amazonaws.com:sub}/*"
+      Roles:
+        - !Sub "${AmplifyStackName}-authRole"
+
+  UserFileBucketUnauthRolePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:DeleteObject"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}/public/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}/uploads/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}/protected/*"
+          - Effect: "Allow"
+            Action:
+              - "s3:ListBucket"
+            Resource: !Sub "arn:aws:s3:::${UserFileBucket}"
+            Condition:
+              StringLike:
+                "s3:prefix":
+                  - "public/"
+                  - "public/*"
+                  - "protected/"
+                  - "protected/*"
+      Roles:
+        - !Sub "${AmplifyStackName}-unauthRole"
+Outputs:
+  ApiURL:
+    Description: "API endpoint URL for Prod environment"
+    Value: !Sub "https://${DocumentScannerAPI}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+
+  UserFileBucket:
+    Description: "Bucket name"
+    Value: !Ref UserFileBucket
+
+  Region:
+    Description: "Region where the backend is deployed"
+    Value: !Ref "AWS::Region"
